@@ -11,29 +11,28 @@
 """
 Exa Pool MCP Server
 
-Wraps the Exa Pool API as an MCP server.
-
 - Local (Claude Desktop / Claude Code): STDIO transport
-- Cloud (ClawCloud / k8s / Docker): Streamable HTTP transport (remote MCP URL)
+- Cloud (ClawCloud / Docker / K8s): Streamable HTTP transport (remote MCP URL)
 
-Env vars:
+Required env:
   EXA_POOL_BASE_URL      e.g. https://your-exa-pool.example.com
   EXA_POOL_API_KEY       your API key
 
-Optional (server):
-  MCP_TRANSPORT          "stdio" | "streamable-http"   (default: auto by presence of PORT)
-  MCP_HOST               default: 0.0.0.0 (http) / 127.0.0.1 (stdio)
-  PORT                   default: 8000 (http)
-  MCP_PATH               default: /mcp
+Recommended env for cloud:
+  MCP_TRANSPORT=streamable-http
+  PORT=8000
+  MCP_HOST=0.0.0.0
+  MCP_PATH=/mcp
 
-Optional (security):
-  MCP_ENABLE_DNS_REBINDING_PROTECTION   "true"/"false" (default: false)
-  MCP_ALLOWED_HOSTS       comma-separated, e.g. "localhost:*,127.0.0.1:*,your.domain:*"
-  MCP_ALLOWED_ORIGINS     comma-separated, e.g. "http://localhost:*,https://your.domain:*"
+Security (optional):
+  MCP_ENABLE_DNS_REBINDING_PROTECTION=true/false (default: false)
+  MCP_ALLOWED_HOSTS=comma,separated,hosts
+  MCP_ALLOWED_ORIGINS=comma,separated,origins
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -45,14 +44,14 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 
 # ------------------------------------------------------------------------------
-# Logging (important: never use print when stdio transport is used)
+# Logging (IMPORTANT: avoid print when using stdio transport)
 # ------------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler()],
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("exa-pool-mcp")
 
 
 # ------------------------------------------------------------------------------
@@ -73,21 +72,22 @@ def _env_csv(name: str) -> list[str]:
 
 
 # ------------------------------------------------------------------------------
-# Transport selection (auto)
+# Transport selection
 # ------------------------------------------------------------------------------
 DEFAULT_TRANSPORT = "streamable-http" if os.getenv("PORT") else "stdio"
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", DEFAULT_TRANSPORT).strip().lower()
 
-MCP_PATH = os.getenv("MCP_PATH", "/mcp").strip() or "/mcp"
+MCP_PATH = (os.getenv("MCP_PATH", "/mcp").strip() or "/mcp")
 MCP_PORT = int(os.getenv("PORT", "8000"))
 
-# For cloud deployments you almost always want 0.0.0.0
-DEFAULT_HOST = "0.0.0.0" if MCP_TRANSPORT == "streamable-http" else "127.0.0.1"
-MCP_HOST = os.getenv("MCP_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
+DEFAULT_HOST = "0.0.0.0" if MCP_TRANSPORT in {"http", "streamable-http", "streamable_http"} else "127.0.0.1"
+MCP_HOST = (os.getenv("MCP_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST)
 
 
 # ------------------------------------------------------------------------------
 # Transport security (DNS rebinding protection)
+# NOTE: Fix for pydantic ValidationError:
+# allowed_hosts / allowed_origins MUST be a list (can be empty), NOT None.
 # ------------------------------------------------------------------------------
 enable_dns_rebinding = _env_bool("MCP_ENABLE_DNS_REBINDING_PROTECTION", default=False)
 allowed_hosts = _env_csv("MCP_ALLOWED_HOSTS")
@@ -95,35 +95,47 @@ allowed_origins = _env_csv("MCP_ALLOWED_ORIGINS")
 
 transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=enable_dns_rebinding,
-    allowed_hosts=allowed_hosts if allowed_hosts else None,
-    allowed_origins=allowed_origins if allowed_origins else None,
+    allowed_hosts=allowed_hosts,        # ✅ always list (possibly empty)
+    allowed_origins=allowed_origins,    # ✅ always list (possibly empty)
 )
 
 if enable_dns_rebinding:
-    logger.info(
-        "DNS rebinding protection ENABLED (allowed_hosts=%s allowed_origins=%s)",
-        allowed_hosts,
-        allowed_origins,
-    )
+    logger.info("DNS rebinding protection ENABLED (allowed_hosts=%s allowed_origins=%s)", allowed_hosts, allowed_origins)
 else:
-    logger.info("DNS rebinding protection DISABLED (common for reverse-proxy deployments)")
+    logger.info("DNS rebinding protection DISABLED (common behind reverse proxies)")
 
 
 # ------------------------------------------------------------------------------
-# MCP server instance
+# Create MCP server instance (defensive for SDK kwarg differences)
 # ------------------------------------------------------------------------------
-mcp = FastMCP(
-    "exa-pool",
-    # HTTP settings (these are used when running streamable-http)
-    host=MCP_HOST,
-    port=MCP_PORT,
-    streamable_http_path=MCP_PATH,
-    # Recommended for streamable-http deployments
-    stateless_http=True,
-    json_response=True,
-    # Avoid 421 Invalid Host Header behind proxies unless you explicitly allow hosts
-    transport_security=transport_security,
-)
+def _create_mcp() -> FastMCP:
+    # Prefer these settings for remote deployments (if supported by your installed mcp version)
+    preferred_kwargs = {
+        "stateless_http": True,
+        "json_response": True,
+        "transport_security": transport_security,
+    }
+
+    # Try progressively removing kwargs if some versions don't support them
+    try_orders = [
+        ["stateless_http", "json_response", "transport_security"],
+        ["json_response", "transport_security"],
+        ["transport_security"],
+        [],
+    ]
+
+    for keys in try_orders:
+        kwargs = {k: preferred_kwargs[k] for k in keys if k in preferred_kwargs}
+        try:
+            return FastMCP("exa-pool", **kwargs)
+        except TypeError:
+            continue
+
+    # Last resort
+    return FastMCP("exa-pool")
+
+
+mcp = _create_mcp()
 
 
 # ------------------------------------------------------------------------------
@@ -136,17 +148,16 @@ TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
 
 # ------------------------------------------------------------------------------
-# Helper functions
+# Helpers
 # ------------------------------------------------------------------------------
-def format_error(status_code: int, message: str) -> str:
+def _format_error(status_code: int, message: str) -> str:
     return f"Error {status_code}: {message}"
 
 
-def format_json_response(data: dict) -> str:
+def _format_json(data: dict) -> str:
     try:
         return json.dumps(data, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error("Failed to format JSON: %s", e)
+    except Exception:
         return str(data)
 
 
@@ -156,9 +167,6 @@ async def make_exa_request(
     data: Optional[dict] = None,
     params: Optional[dict] = None,
 ) -> str:
-    """
-    Make a request to the Exa Pool API with proper error handling.
-    """
     if not EXA_POOL_BASE_URL:
         return "Error: EXA_POOL_BASE_URL is not set."
     if not EXA_POOL_API_KEY:
@@ -175,52 +183,36 @@ async def make_exa_request(
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             method_u = method.upper()
             if method_u == "POST":
-                response = await client.post(url, json=data, headers=headers)
+                resp = await client.post(url, json=data, headers=headers)
             elif method_u == "GET":
-                response = await client.get(url, params=params, headers=headers)
+                resp = await client.get(url, params=params, headers=headers)
             else:
                 return f"Error: Unsupported HTTP method: {method}"
 
-            if response.status_code == 401:
-                logger.error("Authentication failed - API key may be invalid")
-                return format_error(401, "Authentication failed. API key may be invalid.")
-            if response.status_code == 403:
-                logger.error("Access forbidden")
-                return format_error(403, "Access denied.")
-            if response.status_code == 404:
-                logger.error("Endpoint not found: %s", endpoint)
-                return format_error(404, f"Endpoint not found: {endpoint}")
-            if response.status_code == 429:
-                logger.warning("Rate limited")
-                return format_error(429, "Rate limited. Please try again later.")
-            if response.status_code >= 500:
-                logger.error("Server error: %s", response.status_code)
-                return format_error(
-                    response.status_code,
-                    "Exa Pool server error. The service may be temporarily unavailable.",
-                )
+            if resp.status_code == 401:
+                return _format_error(401, "Authentication failed. API key may be invalid.")
+            if resp.status_code == 403:
+                return _format_error(403, "Access denied.")
+            if resp.status_code == 404:
+                return _format_error(404, f"Endpoint not found: {endpoint}")
+            if resp.status_code == 429:
+                return _format_error(429, "Rate limited. Please try again later.")
+            if resp.status_code >= 500:
+                return _format_error(resp.status_code, "Exa Pool server error. Try again later.")
 
-            response.raise_for_status()
-            result = response.json()
-            return format_json_response(result)
+            resp.raise_for_status()
+            return _format_json(resp.json())
 
     except httpx.TimeoutException:
-        logger.error("Request timeout for %s", endpoint)
-        return "Error: Request timed out after 30 seconds. The Exa Pool API may be slow or unavailable."
-    except httpx.ConnectError as e:
-        logger.error("Connection error: %s", e)
-        return f"Error: Unable to connect to Exa Pool API at {EXA_POOL_BASE_URL}. Please check the service status."
+        return "Error: Request timed out after 30 seconds."
+    except httpx.ConnectError:
+        return f"Error: Unable to connect to Exa Pool API at {EXA_POOL_BASE_URL}."
     except httpx.HTTPStatusError as e:
-        logger.error("HTTP error %s: %s", e.response.status_code, e)
-        return format_error(
-            e.response.status_code,
-            f"HTTP request failed: {e.response.reason_phrase}",
-        )
-    except ValueError as e:
-        logger.error("Invalid JSON response: %s", e)
+        return _format_error(e.response.status_code, f"HTTP request failed: {e.response.reason_phrase}")
+    except ValueError:
         return "Error: Received invalid JSON response from Exa Pool API."
     except Exception as e:
-        logger.error("Unexpected error: %s", e, exc_info=True)
+        logger.exception("Unexpected error")
         return f"Error: {type(e).__name__}: {str(e)}"
 
 
@@ -234,9 +226,7 @@ async def exa_search(
     search_type: str = "auto",
     include_text: bool = False,
 ) -> str:
-    """
-    Search the web using Exa's AI-powered search engine.
-    """
+    """Search the web using Exa (via Exa Pool)."""
     if not query or not query.strip():
         return "Error: query parameter is required and cannot be empty"
     if not 1 <= num_results <= 100:
@@ -248,7 +238,7 @@ async def exa_search(
     if include_text:
         payload["contents"] = {"text": True}
 
-    logger.info("Searching Exa: query=%r num_results=%s type=%s", query, num_results, search_type)
+    logger.info("exa_search query=%r num_results=%s type=%s", query, num_results, search_type)
     return await make_exa_request("/search", data=payload)
 
 
@@ -258,9 +248,7 @@ async def exa_get_contents(
     include_text: bool = True,
     include_html: bool = False,
 ) -> str:
-    """
-    Get clean, parsed content from one or more web pages.
-    """
+    """Get clean content from one or more web pages."""
     if not urls:
         return "Error: urls parameter is required and cannot be empty"
     if len(urls) > 100:
@@ -274,7 +262,7 @@ async def exa_get_contents(
     if include_html:
         payload["htmlContent"] = True
 
-    logger.info("Fetching contents for %s URL(s)", len(urls))
+    logger.info("exa_get_contents urls=%s", len(urls))
     return await make_exa_request("/contents", data=payload)
 
 
@@ -284,9 +272,7 @@ async def exa_find_similar(
     num_results: int = 10,
     include_text: bool = False,
 ) -> str:
-    """
-    Find web pages similar to a given URL using semantic similarity.
-    """
+    """Find web pages similar to a given URL."""
     if not url or not url.strip():
         return "Error: url parameter is required and cannot be empty"
     if not url.startswith(("http://", "https://")):
@@ -298,28 +284,24 @@ async def exa_find_similar(
     if include_text:
         payload["contents"] = {"text": True}
 
-    logger.info("Finding similar pages to: %s", url)
+    logger.info("exa_find_similar url=%s", url)
     return await make_exa_request("/findSimilar", data=payload)
 
 
 @mcp.tool()
 async def exa_answer(query: str, include_text: bool = False) -> str:
-    """
-    Get an AI-generated answer to a question using Exa's Answer API.
-    """
+    """Get an AI-generated answer via Exa (Answer API through Exa Pool)."""
     if not query or not query.strip():
         return "Error: query parameter is required and cannot be empty"
 
     payload: dict = {"query": query.strip(), "text": include_text}
-    logger.info("Getting answer for: %s", query)
+    logger.info("exa_answer query=%r", query)
     return await make_exa_request("/answer", data=payload)
 
 
 @mcp.tool()
 async def exa_create_research(instructions: str, model: str = "exa-research") -> str:
-    """
-    Create an asynchronous deep research task.
-    """
+    """Create an async research task."""
     if not instructions or not instructions.strip():
         return "Error: instructions parameter is required and cannot be empty"
     if len(instructions) > 4096:
@@ -328,71 +310,63 @@ async def exa_create_research(instructions: str, model: str = "exa-research") ->
         return "Error: model must be one of: exa-research-fast, exa-research, exa-research-pro"
 
     payload: dict = {"instructions": instructions.strip(), "model": model}
-    logger.info("Creating research task with model: %s", model)
+    logger.info("exa_create_research model=%s", model)
     return await make_exa_request("/research/v1", data=payload)
 
 
 @mcp.tool()
 async def exa_get_research(research_id: str) -> str:
-    """
-    Get the status and results of a research task.
-    """
+    """Get status/results of a research task."""
     if not research_id or not research_id.strip():
         return "Error: research_id parameter is required and cannot be empty"
 
-    logger.info("Getting research task: %s", research_id)
+    logger.info("exa_get_research id=%s", research_id)
     return await make_exa_request(f"/research/v1/{research_id.strip()}", method="GET")
 
 
 # ------------------------------------------------------------------------------
-# Main entry
+# Runners
 # ------------------------------------------------------------------------------
 def _run_stdio() -> None:
-    logger.info("Starting Exa Pool MCP Server (transport=stdio)")
-    if EXA_POOL_BASE_URL:
-        logger.info("API configured: %s...", EXA_POOL_BASE_URL[:24])
-    else:
-        logger.warning("EXA_POOL_BASE_URL not set - server may not function correctly")
+    logger.info("Starting MCP server (transport=stdio)")
+    if not EXA_POOL_BASE_URL or not EXA_POOL_API_KEY:
+        logger.warning("EXA_POOL_BASE_URL / EXA_POOL_API_KEY not fully set")
     mcp.run(transport="stdio")
 
 
 def _run_streamable_http() -> None:
     """
-    Run as a normal HTTP service (remote MCP URL), plus /health.
+    Run as HTTP service with:
+      - GET /health
+      - MCP at MCP_PATH (default /mcp)
     """
-    import contextlib
-
     import uvicorn
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
     from starlette.routing import Mount, Route
 
-    logger.info(
-        "Starting Exa Pool MCP Server (transport=streamable-http) on %s:%s%s",
-        MCP_HOST,
-        MCP_PORT,
-        MCP_PATH,
-    )
-    if EXA_POOL_BASE_URL:
-        logger.info("API configured: %s...", EXA_POOL_BASE_URL[:24])
-    else:
-        logger.warning("EXA_POOL_BASE_URL not set - server may not function correctly")
+    logger.info("Starting MCP server (transport=streamable-http) on %s:%s path=%s", MCP_HOST, MCP_PORT, MCP_PATH)
+    if not EXA_POOL_BASE_URL or not EXA_POOL_API_KEY:
+        logger.warning("EXA_POOL_BASE_URL / EXA_POOL_API_KEY not fully set")
 
-    mcp_asgi = mcp.streamable_http_app()
+    try:
+        mcp_asgi = mcp.streamable_http_app()
+    except Exception as e:
+        logger.exception("Failed to create streamable_http_app")
+        raise e
 
     async def health(_request):
         return JSONResponse({"status": "ok"})
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
-        # Session manager is created lazily by streamable_http_app()
         async with mcp.session_manager.run():
             yield
 
     app = Starlette(
         routes=[
             Route("/health", health, methods=["GET"]),
-            Mount("/", app=mcp_asgi),
+            Mount(MCP_PATH, app=mcp_asgi),
         ],
         lifespan=lifespan,
     )
